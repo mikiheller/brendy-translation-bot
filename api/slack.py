@@ -61,7 +61,7 @@ def detect_and_translate(text: str) -> dict:
     Returns {"original_language": "en"|"es", "translation": "..."}
     """
     response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[
             {
                 "role": "system",
