@@ -9,37 +9,40 @@ import hashlib
 import hmac
 import time
 from http.server import BaseHTTPRequestHandler
-from openai import OpenAI
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
+
+# Lazy-load clients to avoid initialization errors
+_slack_client = None
+_openai_client = None
 
 
-# Initialize clients
-slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+def get_slack_client():
+    global _slack_client
+    if _slack_client is None:
+        from slack_sdk import WebClient
+        _slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
+    return _slack_client
 
-# Get the bot's own user ID (we'll cache this)
-BOT_USER_ID = None
 
-
-def get_bot_user_id():
-    """Get the bot's user ID to avoid translating our own messages"""
-    global BOT_USER_ID
-    if BOT_USER_ID is None:
-        try:
-            response = slack_client.auth_test()
-            BOT_USER_ID = response["user_id"]
-        except SlackApiError:
-            BOT_USER_ID = "unknown"
-    return BOT_USER_ID
+def get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _openai_client
 
 
 def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
     """Verify that the request actually came from Slack"""
     signing_secret = os.environ.get("SLACK_SIGNING_SECRET", "")
     
+    if not timestamp or not signature:
+        return False
+    
     # Check timestamp to prevent replay attacks
-    if abs(time.time() - int(timestamp)) > 60 * 5:
+    try:
+        if abs(time.time() - int(timestamp)) > 60 * 5:
+            return False
+    except (ValueError, TypeError):
         return False
     
     # Create the signature base string
@@ -60,7 +63,8 @@ def detect_and_translate(text: str) -> dict:
     Detect the language and translate to the other language.
     Returns {"original_language": "en"|"es", "translation": "..."}
     """
-    response = openai_client.chat.completions.create(
+    client = get_openai_client()
+    response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {
@@ -95,6 +99,8 @@ Rules:
 
 def post_translation(channel: str, thread_ts: str, translation: str, original_lang: str):
     """Post the translation as a threaded reply"""
+    from slack_sdk.errors import SlackApiError
+    
     # Add a small indicator of what we did
     if original_lang == "en":
         prefix = "🇪🇸 "  # Spanish flag for English→Spanish
@@ -102,7 +108,7 @@ def post_translation(channel: str, thread_ts: str, translation: str, original_la
         prefix = "🇺🇸 "  # US flag for Spanish→English
     
     try:
-        slack_client.chat_postMessage(
+        get_slack_client().chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
             text=f"{prefix}{translation}"
@@ -117,13 +123,9 @@ def handle_message_event(event: dict):
     if event.get("bot_id") or event.get("subtype"):
         return
     
-    # Ignore messages from this bot
-    if event.get("user") == get_bot_user_id():
-        return
-    
     text = event.get("text", "")
     channel = event.get("channel")
-    message_ts = event.get("ts")  # Use the message timestamp as the thread parent
+    message_ts = event.get("ts")
     
     # Skip empty messages or very short ones
     if not text or len(text.strip()) < 2:
@@ -134,58 +136,68 @@ def handle_message_event(event: dict):
         return
     
     # Translate the message
-    result = detect_and_translate(text)
-    
-    # Only post if we got a valid translation
-    if result.get("translation") and result.get("original_language") in ["en", "es"]:
-        post_translation(
-            channel=channel,
-            thread_ts=message_ts,
-            translation=result["translation"],
-            original_lang=result["original_language"]
-        )
+    try:
+        result = detect_and_translate(text)
+        
+        # Only post if we got a valid translation
+        if result.get("translation") and result.get("original_language") in ["en", "es"]:
+            post_translation(
+                channel=channel,
+                thread_ts=message_ts,
+                translation=result["translation"],
+                original_lang=result["original_language"]
+            )
+    except Exception as e:
+        print(f"Error translating message: {e}")
 
 
 class handler(BaseHTTPRequestHandler):
     """Vercel serverless function handler"""
     
     def do_POST(self):
-        # Read the request body
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length)
-        
-        # Verify the request is from Slack
-        timestamp = self.headers.get('X-Slack-Request-Timestamp', '')
-        signature = self.headers.get('X-Slack-Signature', '')
-        
-        if not verify_slack_signature(body, timestamp, signature):
-            self.send_response(401)
-            self.end_headers()
-            self.wfile.write(b'Invalid signature')
-            return
-        
-        # Parse the JSON body
-        data = json.loads(body.decode('utf-8'))
-        
-        # Handle Slack's URL verification challenge
-        if data.get("type") == "url_verification":
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(data["challenge"].encode())
-            return
-        
-        # Handle event callbacks
-        if data.get("type") == "event_callback":
-            event = data.get("event", {})
+        try:
+            # Read the request body
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
             
-            if event.get("type") == "message":
-                handle_message_event(event)
-        
-        # Always respond with 200 OK quickly (Slack expects this within 3 seconds)
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'ok')
+            # Parse the JSON body first (for url_verification we skip signature check)
+            data = json.loads(body.decode('utf-8'))
+            
+            # Handle Slack's URL verification challenge (no signature check needed)
+            if data.get("type") == "url_verification":
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(data["challenge"].encode())
+                return
+            
+            # Verify the request is from Slack for other requests
+            timestamp = self.headers.get('X-Slack-Request-Timestamp', '')
+            signature = self.headers.get('X-Slack-Signature', '')
+            
+            if not verify_slack_signature(body, timestamp, signature):
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b'Invalid signature')
+                return
+            
+            # Handle event callbacks
+            if data.get("type") == "event_callback":
+                event = data.get("event", {})
+                
+                if event.get("type") == "message":
+                    handle_message_event(event)
+            
+            # Always respond with 200 OK quickly
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'ok')
+            
+        except Exception as e:
+            print(f"Error handling request: {e}")
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f'Error: {str(e)}'.encode())
     
     def do_GET(self):
         """Health check endpoint"""
@@ -193,4 +205,3 @@ class handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/plain')
         self.end_headers()
         self.wfile.write(b'Brendy Translation Bot is running!')
-
