@@ -119,36 +119,54 @@ def post_translation(channel: str, thread_ts: str, translation: str, original_la
 
 def handle_message_event(event: dict):
     """Handle an incoming message event"""
+    print(f"[DEBUG] Received message event: {json.dumps(event)}")
+    
     # Ignore messages from bots (including ourselves)
-    if event.get("bot_id") or event.get("subtype"):
+    if event.get("bot_id"):
+        print("[DEBUG] Skipping: message from bot")
+        return
+    if event.get("subtype"):
+        print(f"[DEBUG] Skipping: message has subtype '{event.get('subtype')}'")
         return
     
     text = event.get("text", "")
     channel = event.get("channel")
     message_ts = event.get("ts")
     
+    print(f"[DEBUG] Processing message: '{text}' in channel {channel}")
+    
     # Skip empty messages or very short ones
     if not text or len(text.strip()) < 2:
+        print("[DEBUG] Skipping: message too short")
         return
     
     # Skip messages that are just URLs or mentions
     if text.startswith("<") and text.endswith(">"):
+        print("[DEBUG] Skipping: message is just URL/mention")
         return
     
     # Translate the message
     try:
+        print("[DEBUG] Calling OpenAI for translation...")
         result = detect_and_translate(text)
+        print(f"[DEBUG] Translation result: {result}")
         
         # Only post if we got a valid translation
         if result.get("translation") and result.get("original_language") in ["en", "es"]:
+            print(f"[DEBUG] Posting translation to Slack...")
             post_translation(
                 channel=channel,
                 thread_ts=message_ts,
                 translation=result["translation"],
                 original_lang=result["original_language"]
             )
+            print("[DEBUG] Translation posted successfully!")
+        else:
+            print(f"[DEBUG] Skipping: invalid translation result")
     except Exception as e:
-        print(f"Error translating message: {e}")
+        print(f"[DEBUG] Error translating message: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 class handler(BaseHTTPRequestHandler):
@@ -175,18 +193,26 @@ class handler(BaseHTTPRequestHandler):
             timestamp = self.headers.get('X-Slack-Request-Timestamp', '')
             signature = self.headers.get('X-Slack-Signature', '')
             
+            print(f"[DEBUG] Request type: {data.get('type')}")
+            
             if not verify_slack_signature(body, timestamp, signature):
+                print("[DEBUG] Signature verification FAILED")
                 self.send_response(401)
                 self.end_headers()
                 self.wfile.write(b'Invalid signature')
                 return
             
+            print("[DEBUG] Signature verification passed")
+            
             # Handle event callbacks
             if data.get("type") == "event_callback":
                 event = data.get("event", {})
+                print(f"[DEBUG] Event type: {event.get('type')}")
                 
                 if event.get("type") == "message":
                     handle_message_event(event)
+                else:
+                    print(f"[DEBUG] Ignoring event type: {event.get('type')}")
             
             # Always respond with 200 OK quickly
             self.send_response(200)
