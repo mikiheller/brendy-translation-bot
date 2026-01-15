@@ -195,6 +195,15 @@ class handler(BaseHTTPRequestHandler):
             
             print(f"[DEBUG] Request type: {data.get('type')}")
             
+            # Ignore Slack retries to prevent duplicate translations
+            retry_num = self.headers.get('X-Slack-Retry-Num')
+            if retry_num:
+                print(f"[DEBUG] Ignoring Slack retry #{retry_num}")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'ok')
+                return
+            
             if not verify_slack_signature(body, timestamp, signature):
                 print("[DEBUG] Signature verification FAILED")
                 self.send_response(401)
