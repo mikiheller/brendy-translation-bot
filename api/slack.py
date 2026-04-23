@@ -157,13 +157,12 @@ def detect_and_translate(text: str, thread_context: list | None = None) -> dict:
     )
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
         response_format={"type": "json_object"},
-        temperature=0.3,
     )
 
     result = json.loads(response.choices[0].message.content)

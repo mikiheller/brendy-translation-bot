@@ -97,6 +97,6 @@ cp .env.example .env
 
 - **Python** - Core language
 - **Slack SDK** - Slack API integration
-- **OpenAI GPT-4o-mini** - Language detection & translation
+- **OpenAI GPT-5** - Language detection, intent inference & translation
 - **Vercel** - Serverless hosting
 
