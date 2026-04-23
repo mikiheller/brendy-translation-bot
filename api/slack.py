@@ -58,41 +58,114 @@ def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
     return hmac.compare_digest(my_signature, signature)
 
 
-def detect_and_translate(text: str) -> dict:
+SYSTEM_PROMPT = """You are a translation assistant for a household Slack workspace where Miki (English speaker, the homeowner) communicates with his house cleaner (native Spanish speaker). Messages from the cleaner are often casual, may contain typos, missing words, missing punctuation, or phonetic misspellings (e.g. "boy" for "soy", "Vasura" for "Basura"). Your job is NOT to translate words literally — it is to translate the INTENT of what the person most likely meant.
+
+Your job:
+1. Detect if the input is primarily English or Spanish.
+2. Figure out what the sender most likely MEANT to say, using:
+   - The thread context provided above (if any). This is the single most important signal for disambiguation.
+   - Common sense about typical household cleaner / homeowner conversations (lost items, trash, packages, cleaning schedules, instructions about where things go, etc.).
+   - Spanish phonetic typos: "boy"→"soy", "Vasura"→"Basura", "ablar"→"hablar", missing accents, etc.
+3. Translate the intended meaning into the OTHER language.
+
+Respond in JSON:
+{"original_language": "en" or "es", "translation": "the translated text"}
+
+Rules for meaning and punctuation:
+- If a message looks like it could be a question given the thread context (e.g. the cleaner holding up an item and saying "this is trash" as a reply to no prior question), translate it as a question with a "?". Example: "Hola miki esto es Vasura" after Miki posted a photo of items → "Hi Miki, is this trash?" (not "Hi Miki, this is trash").
+- Correct obvious typos silently in the translation. Do not mention the correction.
+- If the sender omits a word that is obvious from context, include it in the translation.
+- When genuinely ambiguous between statement vs. question and no context resolves it, prefer the interpretation that makes the message more useful to reply to (usually a question).
+
+Rules for formatting (CRITICAL):
+- Preserve the original formatting EXACTLY: line breaks (\\n), blank lines between paragraphs, bullet characters (•, -, *, ●), numbered lists, indentation, and emojis.
+- If the input has bullet points on separate lines, the translation MUST have bullet points on separate lines.
+- Do not merge multiple lines into one paragraph.
+- Do not add or remove blank lines.
+
+Rules for tone:
+- Keep it casual and friendly (household communication).
+- Preserve emojis.
+
+Skip rule:
+- If the text is just emojis, punctuation, URLs, or otherwise can't be translated, return {"original_language": "unknown", "translation": null}."""
+
+
+def get_thread_context(channel: str, thread_ts: str, current_ts: str, limit: int = 10) -> list:
     """
-    Detect the language and translate to the other language.
+    Fetch recent messages in the same thread (excluding the current one) to give
+    the translator conversational context. Returns a list of {"user_label", "text"}
+    dicts ordered oldest -> newest, capped to `limit`.
+    """
+    if not channel or not thread_ts:
+        return []
+
+    from slack_sdk.errors import SlackApiError
+    try:
+        resp = get_slack_client().conversations_replies(
+            channel=channel,
+            ts=thread_ts,
+            limit=50,
+            inclusive=True,
+        )
+    except SlackApiError as e:
+        print(f"Error fetching thread context: {e}")
+        return []
+
+    messages = resp.get("messages", []) or []
+    context = []
+    for msg in messages:
+        if msg.get("ts") == current_ts:
+            continue
+        text = msg.get("text") or ""
+        if not text.strip():
+            continue
+        # Skip the translator bot's own replies — they're just translations of other messages
+        # already in the thread, and including them would duplicate context and confuse the model.
+        if msg.get("bot_id") or msg.get("subtype") == "bot_message":
+            continue
+        label = f"user_{msg.get('user', 'unknown')}"
+        context.append({"user_label": label, "text": text})
+
+    return context[-limit:]
+
+
+def detect_and_translate(text: str, thread_context: list | None = None) -> dict:
+    """
+    Detect the language and translate to the other language, using optional
+    thread context to infer the sender's intent.
     Returns {"original_language": "en"|"es", "translation": "..."}
     """
     client = get_openai_client()
+
+    context_block = ""
+    if thread_context:
+        lines = []
+        for m in thread_context:
+            lines.append(f"[{m['user_label']}]: {m['text']}")
+        context_block = (
+            "Prior messages in this Slack thread (oldest first). Use this to infer "
+            "what the latest message most likely means:\n\n"
+            + "\n\n".join(lines)
+            + "\n\n---\n\n"
+        )
+
+    user_content = (
+        context_block
+        + "Latest message to translate (translate ONLY this, not the context above):\n"
+        + text
+    )
+
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {
-                "role": "system",
-                "content": """You are a translation assistant. Your job is to:
-1. Detect if the input text is in English or Spanish
-2. Translate it to the OTHER language
-
-Respond in JSON format:
-{"original_language": "en" or "es", "translation": "the translated text"}
-
-Rules:
-- If the text is in English, translate to Spanish
-- If the text is in Spanish, translate to English  
-- Keep the tone casual and friendly (this is for household communication)
-- Preserve any emojis
-- If the text is just emojis, punctuation, or can't be translated, return {"original_language": "unknown", "translation": null}
-"""
-            },
-            {
-                "role": "user",
-                "content": text
-            }
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
         ],
         response_format={"type": "json_object"},
-        temperature=0.3
+        temperature=0.3,
     )
-    
+
     result = json.loads(response.choices[0].message.content)
     return result
 
@@ -120,6 +193,7 @@ def handle_message_event(event: dict):
     text = event.get("text", "")
     channel = event.get("channel")
     message_ts = event.get("ts")
+    thread_ts = event.get("thread_ts") or message_ts
     
     # Skip empty messages or very short ones
     if not text or len(text.strip()) < 2:
@@ -129,9 +203,16 @@ def handle_message_event(event: dict):
     if text.startswith("<") and text.endswith(">"):
         return
     
+    # Pull thread context so the translator can infer the sender's intent
+    try:
+        thread_context = get_thread_context(channel, thread_ts, message_ts)
+    except Exception as e:
+        print(f"Error getting thread context: {e}")
+        thread_context = []
+    
     # Translate the message
     try:
-        result = detect_and_translate(text)
+        result = detect_and_translate(text, thread_context=thread_context)
         
         # Only post if we got a valid translation
         if result.get("translation") and result.get("original_language") in ["en", "es"]:
